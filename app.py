@@ -4,11 +4,21 @@ from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# Чтение ключей из настроек сервера Render
+# ============================================================
+# BYBIT API KEYS
+# ============================================================
+
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-# Подключение к Bybit (Unified Account API)
+if not API_KEY or not API_SECRET:
+    print("WARNING: BYBIT_API_KEY or BYBIT_API_SECRET is not set")
+
+
+# ============================================================
+# BYBIT CONNECTION
+# ============================================================
+
 session = HTTP(
     testnet=False,
     api_key=API_KEY,
@@ -16,41 +26,69 @@ session = HTTP(
 )
 
 
+# ============================================================
+# MAIN PAGE
+# ============================================================
+
 @app.route("/", methods=["GET"])
 def home():
     return "Bybit Webhook Server is Running!", 200
 
 
+# ============================================================
+# WEBHOOK
+# ============================================================
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-
-    if not data:
-        return jsonify({
-            "status": "error",
-            "message": "No JSON payload provided"
-        }), 400
 
     try:
-        # Получаем тикер.
-        # Например: AKEUSDT.P -> AKEUSDT
-        raw_symbol = data.get("symbol", "BTCUSDT")
+        data = request.get_json(silent=True)
+
+        if not data:
+            return jsonify({
+                "status": "error",
+                "message": "No JSON payload provided"
+            }), 400
+
+        print("WEBHOOK RECEIVED:", data)
+
+        # ----------------------------------------------------
+        # SYMBOL
+        # ----------------------------------------------------
+
+        raw_symbol = str(data.get("symbol", "BTCUSDT"))
+
+        # TradingView может присылать AKEUSDT.P
         symbol = raw_symbol.replace(".P", "").upper()
 
-        # Получаем действие:
-        # buy / sell / close
-        action = str(data.get("action", "")).lower()
+        # ----------------------------------------------------
+        # ACTION
+        # ----------------------------------------------------
 
-        # -------------------------------------------------
-        # 1. ОТКРЫТИЕ LONG
-        # -------------------------------------------------
+        action = str(data.get("action", "")).lower().strip()
+
+        # ----------------------------------------------------
+        # QTY
+        # ----------------------------------------------------
+
+        qty = str(data.get("qty", "")).strip()
+
+        print("SYMBOL:", symbol)
+        print("ACTION:", action)
+        print("QTY:", qty)
+
+        # ====================================================
+        # BUY = OPEN LONG
+        # ====================================================
+
         if action == "buy":
-            qty = str(data.get("qty", ""))
 
             if not qty or qty == "0":
                 return jsonify({
                     "status": "error",
-                    "message": "Quantity is missing or zero"
+                    "message": "Quantity is empty or zero",
+                    "symbol": symbol
                 }), 400
 
             response = session.place_order(
@@ -61,6 +99,8 @@ def webhook():
                 qty=qty
             )
 
+            print("BUY RESPONSE:", response)
+
             return jsonify({
                 "status": "success",
                 "action": "buy",
@@ -69,12 +109,12 @@ def webhook():
                 "response": response
             }), 200
 
-        # -------------------------------------------------
-        # 2. ЗАКРЫТИЕ LONG
-        # TradingView может прислать "sell"
-        # или "close"
-        # -------------------------------------------------
-        elif action in ("close", "sell"):
+
+        # ====================================================
+        # SELL / CLOSE = CLOSE LONG
+        # ====================================================
+
+        elif action in ["sell", "close"]:
 
             # Получаем текущую позицию
             pos_info = session.get_positions(
@@ -82,24 +122,49 @@ def webhook():
                 symbol=symbol
             )
 
-            positions = pos_info.get("result", {}).get("list", [])
+            print("POSITION RESPONSE:", pos_info)
+
+            positions = (
+                pos_info
+                .get("result", {})
+                .get("list", [])
+            )
 
             close_qty = "0"
 
+            # Ищем открытую позицию
             for pos in positions:
-                if float(pos.get("size", 0)) > 0:
-                    close_qty = pos.get("size")
+
+                position_size = float(
+                    pos.get("size", 0) or 0
+                )
+
+                if position_size > 0:
+
+                    close_qty = str(
+                        pos.get("size")
+                    )
+
                     break
 
-            # Если позиции нет — ничего не делаем
+
+            # ------------------------------------------------
+            # Позиции нет
+            # ------------------------------------------------
+
             if float(close_qty) <= 0:
+
                 return jsonify({
                     "status": "ignored",
                     "message": "No open position found to close",
                     "symbol": symbol
                 }), 200
 
-            # Закрываем Long рыночной продажей
+
+            # ------------------------------------------------
+            # Закрываем LONG
+            # ------------------------------------------------
+
             response = session.place_order(
                 category="linear",
                 symbol=symbol,
@@ -109,6 +174,8 @@ def webhook():
                 reduceOnly=True
             )
 
+            print("CLOSE RESPONSE:", response)
+
             return jsonify({
                 "status": "success",
                 "action": "close",
@@ -117,24 +184,44 @@ def webhook():
                 "response": response
             }), 200
 
-        # -------------------------------------------------
-        # 3. НЕИЗВЕСТНОЕ ДЕЙСТВИЕ
-        # -------------------------------------------------
+
+        # ====================================================
+        # UNKNOWN ACTION
+        # ====================================================
+
         else:
+
             return jsonify({
                 "status": "error",
-                "message": f"Unknown action: {action}"
+                "message": f"Unknown action: {action}",
+                "symbol": symbol,
+                "received_data": data
             }), 400
 
+
+    # ========================================================
+    # ERROR
+    # ========================================================
+
     except Exception as e:
+
+        print("WEBHOOK ERROR:", str(e))
+
         return jsonify({
             "status": "error",
             "message": str(e)
         }), 500
 
 
+# ============================================================
+# START SERVER
+# ============================================================
+
 if __name__ == "__main__":
+
+    port = int(os.environ.get("PORT", 5000))
+
     app.run(
         host="0.0.0.0",
-        port=5000
+        port=port
     )
