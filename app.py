@@ -14,7 +14,7 @@ session = HTTP(
     api_secret=os.environ.get("BYBIT_API_SECRET")
 )
 
-@app.route('/', methods=['GET'])
+@app.route('/', methods=['GET', 'HEAD'])
 def home():
     return "Bot is running!", 200
 
@@ -43,7 +43,6 @@ def webhook():
         # Для закрытия позиции (exit)
         if "exit" in action.lower() or "close" in action.lower():
             response = session.cancel_all_orders(category="linear", symbol=symbol)
-            # Открытие противоположного ордера или закрытие по рынку
             side_to_close = "Sell" if "long" in action.lower() else "Buy"
             response = session.place_order(
                 category="linear",
