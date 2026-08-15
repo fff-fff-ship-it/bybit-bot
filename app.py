@@ -12,11 +12,8 @@ app = Flask(__name__)
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-# Для тестовой сети:
-# BYBIT_TESTNET=true
-#
-# Для реального Bybit:
-# BYBIT_TESTNET=false
+# Для тестовой сети: BYBIT_TESTNET=true
+# Для реального Bybit: BYBIT_TESTNET=false
 TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 
 
@@ -98,7 +95,7 @@ def get_long_position(symbol):
 
 
 # =========================================================
-# TEST
+# WEBHOOK ENDPOINT
 # =========================================================
 
 @app.route("/webhook", methods=["POST"])
@@ -107,10 +104,10 @@ def webhook():
     try:
 
         # -------------------------------------------------
-        # RECEIVE JSON
+        # RECEIVE JSON (force=True спасает от ошибок формата)
         # -------------------------------------------------
 
-        data = request.get_json(silent=True)
+        data = request.get_json(force=True, silent=True) or {}
 
         print("==============================================")
         print("WEBHOOK RECEIVED:")
@@ -120,7 +117,7 @@ def webhook():
         if not data:
             return jsonify({
                 "status": "error",
-                "message": "JSON body is empty"
+                "message": "JSON body is empty or invalid"
             }), 400
 
 
