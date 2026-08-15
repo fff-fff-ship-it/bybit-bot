@@ -1,7 +1,4 @@
 import os
-import hmac
-import hashlib
-import time
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
@@ -14,9 +11,10 @@ session = HTTP(
     api_secret=os.environ.get("BYBIT_API_SECRET")
 )
 
+# Этот маршрут нужен для UptimeRobot, он понимает и GET, и HEAD
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
-    return "Bot is running!", 200
+    return "", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -42,7 +40,7 @@ def webhook():
     try:
         # Для закрытия позиции (exit)
         if "exit" in action.lower() or "close" in action.lower():
-            response = session.cancel_all_orders(category="linear", symbol=symbol)
+            session.cancel_all_orders(category="linear", symbol=symbol)
             side_to_close = "Sell" if "long" in action.lower() else "Buy"
             response = session.place_order(
                 category="linear",
