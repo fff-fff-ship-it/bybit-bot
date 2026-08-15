@@ -2,22 +2,21 @@ import os
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
-
 app = Flask(__name__)
 
 
-# ============================================================
-# BYBIT
-# ============================================================
+# =========================================================
+# BYBIT SETTINGS
+# =========================================================
 
 API_KEY = os.getenv("BYBIT_API_KEY")
 API_SECRET = os.getenv("BYBIT_API_SECRET")
 
-# Для реального Bybit:
-# BYBIT_TESTNET=false
-#
 # Для тестовой сети:
 # BYBIT_TESTNET=true
+#
+# Для реального Bybit:
+# BYBIT_TESTNET=false
 TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 
 
@@ -28,109 +27,55 @@ if not API_KEY or not API_SECRET:
 session = HTTP(
     testnet=TESTNET,
     api_key=API_KEY,
-    api_secret=API_SECRET,
+    api_secret=API_SECRET
 )
 
 
-# ============================================================
-# ГЛАВНАЯ
-# ============================================================
+# =========================================================
+# MAIN PAGE
+# =========================================================
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Сервер Bybit Webhook запущен", 200
+    return "Bybit Webhook Server is running", 200
 
 
-# ============================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================
+# =========================================================
+# SYMBOL NORMALIZATION
+# =========================================================
 
 def normalize_symbol(raw_symbol):
     """
-    TradingView может прислать, например:
-    AKEUSDT.P
+    TradingView может прислать:
+        AKEUSDT.P
+        BYBIT:AKEUSDT.P
+        AKEUSDT
 
     Bybit для linear использует:
-    AKEUSDT
+        AKEUSDT
     """
 
-    if not raw_symbol:
-        return ""
+    symbol = str(raw_symbol or "").strip().upper()
 
-    symbol = str(raw_symbol).strip().upper()
+    # Убираем название биржи
+    if ":" in symbol:
+        symbol = symbol.split(":")[-1]
 
-    # Убираем суффикс perpetual от TradingView
-    symbol = symbol.replace(".P", "")
+    # Убираем .P от TradingView
+    if symbol.endswith(".P"):
+        symbol = symbol[:-2]
 
     return symbol
 
 
-def normalize_action(raw_action):
-    """
-    Приводим действие TradingView к:
-    buy / sell / close
-    """
+# =========================================================
+# GET CURRENT LONG POSITION
+# =========================================================
 
-    if raw_action is None:
-        return ""
-
-    return str(raw_action).strip().lower()
-
-
-def normalize_qty(raw_qty):
-    """
-    Количество должно быть положительным.
-    Возвращаем строку — Bybit API принимает qty как string.
-    """
-
-    if raw_qty is None:
-        return ""
-
-    try:
-        qty = float(raw_qty)
-    except (ValueError, TypeError):
-        return ""
-
-    if qty <= 0:
-        return ""
-
-    # Не используем научную запись
-    return format(qty, "f").rstrip("0").rstrip(".")
-
-
-def bybit_error_response(response):
-    """
-    Проверяем настоящий ответ Bybit.
-    retCode == 0 означает успешное принятие запроса.
-    """
-
-    if not isinstance(response, dict):
-        return {
-            "ok": False,
-            "retCode": -1,
-            "retMsg": "Bybit вернул ответ неизвестного формата",
-        }
-
-    ret_code = response.get("retCode", -1)
-    ret_msg = response.get("retMsg", "")
-
-    if ret_code != 0:
-        return {
-            "ok": False,
-            "retCode": ret_code,
-            "retMsg": ret_msg,
-        }
-
-    return {
-        "ok": True,
-        "retCode": 0,
-        "retMsg": ret_msg or "OK",
-    }
-
-
-def get_position(symbol):
+def get_long_position(symbol):
     """
     Получаем текущую позицию по символу.
+    Возвращаем размер Long.
     """
 
     response = session.get_positions(
@@ -138,85 +83,71 @@ def get_position(symbol):
         symbol=symbol
     )
 
-    check = bybit_error_response(response)
+    print("POSITION RESPONSE:", response)
 
-    if not check["ok"]:
-        raise RuntimeError(
-            f"Bybit get_positions error "
-            f"{check['retCode']}: {check['retMsg']}"
-        )
+    positions = response.get("result", {}).get("list", [])
 
-    positions = (
-        response
-        .get("result", {})
-        .get("list", [])
-    )
-
-    # Ищем реально открытую позицию
     for position in positions:
-        try:
-            size = float(position.get("size", 0) or 0)
-        except (ValueError, TypeError):
-            size = 0
+        side = position.get("side", "")
+        size = float(position.get("size", 0) or 0)
 
-        if size > 0:
-            return position
+        if side == "Buy" and size > 0:
+            return size
 
-    return None
+    return 0.0
 
 
-# ============================================================
-# WEBHOOK TRADINGVIEW
-# ============================================================
+# =========================================================
+# TEST
+# =========================================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
     try:
 
-        # ----------------------------------------------------
-        # Получаем JSON
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # RECEIVE JSON
+        # -------------------------------------------------
 
         data = request.get_json(silent=True)
+
+        print("==============================================")
+        print("WEBHOOK RECEIVED:")
+        print(data)
+        print("==============================================")
 
         if not data:
             return jsonify({
                 "status": "error",
-                "message": "Не предоставлена полезная нагрузка JSON"
+                "message": "JSON body is empty"
             }), 400
 
-        print("=" * 60)
-        print("WEBHOOK RECEIVED:")
-        print(data)
-        print("=" * 60)
+
+        # -------------------------------------------------
+        # READ DATA
+        # -------------------------------------------------
+
+        raw_symbol = data.get("symbol", "")
+        action = str(data.get("action", "")).lower().strip()
+        qty_raw = data.get("qty", 0)
 
 
-        # ----------------------------------------------------
-        # SYMBOL
-        # ----------------------------------------------------
+        # -------------------------------------------------
+        # NORMALIZE SYMBOL
+        # -------------------------------------------------
 
-        symbol = normalize_symbol(
-            data.get("symbol", "BTCUSDT")
-        )
+        symbol = normalize_symbol(raw_symbol)
 
 
-        # ----------------------------------------------------
-        # ACTION
-        # ----------------------------------------------------
-
-        action = normalize_action(
-            data.get("action", "")
-        )
-
-
-        # ----------------------------------------------------
+        # -------------------------------------------------
         # QTY
-        # ----------------------------------------------------
+        # -------------------------------------------------
 
-        qty = normalize_qty(
-            data.get("qty", "")
-        )
+        try:
+            qty = float(qty_raw)
+        except Exception:
+            qty = 0.0
 
 
         print("SYMBOL:", symbol)
@@ -224,32 +155,45 @@ def webhook():
         print("QTY:", qty)
 
 
-        # ----------------------------------------------------
-        # ПРОВЕРКА SYMBOL
-        # ----------------------------------------------------
+        # =================================================
+        # TEST SIGNAL
+        # =================================================
 
-        if not symbol:
+        if action == "test":
+
+            print("==============================================")
+            print("TEST SIGNAL OK")
+            print("NO ORDER WILL BE SENT TO BYBIT")
+            print("==============================================")
+
             return jsonify({
-                "status": "error",
-                "message": "Не указан symbol"
-            }), 400
+                "status": "success",
+                "message": "test signal received",
+                "symbol": symbol,
+                "qty": qty
+            }), 200
 
 
-        # ====================================================
-        # BUY
-        # ====================================================
+        # =================================================
+        # BUY / OPEN LONG
+        # =================================================
 
         if action == "buy":
 
-            if not qty:
+            if qty <= 0:
                 return jsonify({
                     "status": "error",
-                    "message": "Quantity is empty or zero",
-                    "symbol": symbol
+                    "message": "Invalid quantity",
+                    "symbol": symbol,
+                    "qty": qty
                 }), 400
 
 
-            print("ОТКРЫВАЕМ LONG:", symbol, qty)
+            print("==============================================")
+            print("OPENING LONG")
+            print("SYMBOL:", symbol)
+            print("QTY:", qty)
+            print("==============================================")
 
 
             response = session.place_order(
@@ -257,29 +201,12 @@ def webhook():
                 symbol=symbol,
                 side="Buy",
                 orderType="Market",
-                qty=qty,
-                positionIdx=0,
-                reduceOnly=False
+                qty=str(qty)
             )
 
 
-            print("BYBIT BUY RESPONSE:", response)
-
-
-            check = bybit_error_response(response)
-
-
-            if not check["ok"]:
-
-                return jsonify({
-                    "status": "error",
-                    "action": "buy",
-                    "symbol": symbol,
-                    "qty": qty,
-                    "retCode": check["retCode"],
-                    "retMsg": check["retMsg"],
-                    "response": response
-                }), 400
+            print("BUY RESPONSE:")
+            print(response)
 
 
             return jsonify({
@@ -291,21 +218,33 @@ def webhook():
             }), 200
 
 
-        # ====================================================
-        # SELL
-        # ====================================================
+        # =================================================
+        # CLOSE LONG
+        # =================================================
 
-        elif action == "sell":
+        if action == "close":
 
-            if not qty:
+            print("==============================================")
+            print("CLOSING LONG")
+            print("SYMBOL:", symbol)
+            print("==============================================")
+
+
+            current_qty = get_long_position(symbol)
+
+
+            if current_qty <= 0:
+
+                print("NO LONG POSITION FOUND")
+
                 return jsonify({
-                    "status": "error",
-                    "message": "Quantity is empty or zero",
+                    "status": "ignored",
+                    "message": "No open long position",
                     "symbol": symbol
-                }), 400
+                }), 200
 
 
-            print("ОТКРЫВАЕМ SHORT:", symbol, qty)
+            print("CURRENT LONG SIZE:", current_qty)
 
 
             response = session.place_order(
@@ -313,29 +252,57 @@ def webhook():
                 symbol=symbol,
                 side="Sell",
                 orderType="Market",
-                qty=qty,
-                positionIdx=0,
-                reduceOnly=False
+                qty=str(current_qty),
+                reduceOnly=True
             )
 
 
-            print("BYBIT SELL RESPONSE:", response)
+            print("CLOSE RESPONSE:")
+            print(response)
 
 
-            check = bybit_error_response(response)
+            return jsonify({
+                "status": "success",
+                "action": "close",
+                "symbol": symbol,
+                "qty": current_qty,
+                "response": response
+            }), 200
 
 
-            if not check["ok"]:
+        # =================================================
+        # SELL
+        # =================================================
 
+        if action == "sell":
+
+            if qty <= 0:
                 return jsonify({
                     "status": "error",
-                    "action": "sell",
+                    "message": "Invalid quantity",
                     "symbol": symbol,
-                    "qty": qty,
-                    "retCode": check["retCode"],
-                    "retMsg": check["retMsg"],
-                    "response": response
+                    "qty": qty
                 }), 400
+
+
+            print("==============================================")
+            print("OPENING SHORT")
+            print("SYMBOL:", symbol)
+            print("QTY:", qty)
+            print("==============================================")
+
+
+            response = session.place_order(
+                category="linear",
+                symbol=symbol,
+                side="Sell",
+                orderType="Market",
+                qty=str(qty)
+            )
+
+
+            print("SELL RESPONSE:")
+            print(response)
 
 
             return jsonify({
@@ -347,177 +314,30 @@ def webhook():
             }), 200
 
 
-        # ====================================================
-        # CLOSE
-        # ====================================================
+        # =================================================
+        # UNKNOWN ACTION
+        # =================================================
 
-        elif action == "close":
+        print("UNKNOWN ACTION:", action)
 
-            print("ЗАПРОС НА ЗАКРЫТИЕ:", symbol)
-
-
-            # ------------------------------------------------
-            # Получаем текущую позицию
-            # ------------------------------------------------
-
-            position = get_position(symbol)
+        return jsonify({
+            "status": "error",
+            "message": f"Unknown action: {action}",
+            "symbol": symbol,
+            "received_data": data
+        }), 400
 
 
-            if not position:
-
-                print("ПОЗИЦИЯ НЕ НАЙДЕНА:", symbol)
-
-                return jsonify({
-                    "status": "ignored",
-                    "message": "Не найдена открытая позиция для закрытия",
-                    "symbol": symbol
-                }), 200
-
-
-            position_side = position.get("side", "")
-            position_size = position.get("size", "0")
-            position_idx = position.get("positionIdx", 0)
-
-
-            print("POSITION SIDE:", position_side)
-            print("POSITION SIZE:", position_size)
-            print("POSITION IDX:", position_idx)
-
-
-            try:
-                position_size_float = float(position_size)
-            except (ValueError, TypeError):
-
-                return jsonify({
-                    "status": "error",
-                    "message": "Некорректный размер позиции",
-                    "symbol": symbol,
-                    "size": position_size
-                }), 400
-
-
-            if position_size_float <= 0:
-
-                return jsonify({
-                    "status": "ignored",
-                    "message": "Размер позиции равен нулю",
-                    "symbol": symbol
-                }), 200
-
-
-            # ------------------------------------------------
-            # Для LONG закрытие = SELL
-            # Для SHORT закрытие = BUY
-            # ------------------------------------------------
-
-            if position_side == "Buy":
-                close_side = "Sell"
-
-            elif position_side == "Sell":
-                close_side = "Buy"
-
-            else:
-
-                return jsonify({
-                    "status": "error",
-                    "message": "Неизвестная сторона позиции",
-                    "symbol": symbol,
-                    "side": position_side
-                }), 400
-
-
-            close_qty = normalize_qty(position_size)
-
-
-            if not close_qty:
-
-                return jsonify({
-                    "status": "error",
-                    "message": "Размер позиции для закрытия некорректен",
-                    "symbol": symbol,
-                    "size": position_size
-                }), 400
-
-
-            print(
-                "ЗАКРЫВАЕМ:",
-                symbol,
-                "SIDE:",
-                close_side,
-                "QTY:",
-                close_qty
-            )
-
-
-            # ------------------------------------------------
-            # Закрывающий Market ордер
-            # ------------------------------------------------
-
-            response = session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=close_side,
-                orderType="Market",
-                qty=close_qty,
-                positionIdx=position_idx,
-                reduceOnly=True
-            )
-
-
-            print("BYBIT CLOSE RESPONSE:", response)
-
-
-            check = bybit_error_response(response)
-
-
-            if not check["ok"]:
-
-                return jsonify({
-                    "status": "error",
-                    "action": "close",
-                    "symbol": symbol,
-                    "qty": close_qty,
-                    "side": close_side,
-                    "retCode": check["retCode"],
-                    "retMsg": check["retMsg"],
-                    "response": response
-                }), 400
-
-
-            return jsonify({
-                "status": "success",
-                "action": "close",
-                "symbol": symbol,
-                "qty": close_qty,
-                "side": close_side,
-                "response": response
-            }), 200
-
-
-        # ====================================================
-        # НЕИЗВЕСТНОЕ ДЕЙСТВИЕ
-        # ====================================================
-
-        else:
-
-            return jsonify({
-                "status": "error",
-                "message": f"Неизвестное действие: {action}",
-                "symbol": symbol,
-                "received_data": data
-            }), 400
-
-
-    # ========================================================
-    # ОШИБКА PYTHON / BYBIT / СЕТИ
-    # ========================================================
+    # =====================================================
+    # GENERAL ERROR
+    # =====================================================
 
     except Exception as e:
 
-        print("=" * 60)
-        print("ОШИБКА WEBHOOK:")
+        print("==============================================")
+        print("WEBHOOK ERROR:")
         print(str(e))
-        print("=" * 60)
+        print("==============================================")
 
 
         return jsonify({
@@ -526,15 +346,20 @@ def webhook():
         }), 500
 
 
-# ============================================================
-# ЗАПУСК СЕРВЕРА
-# ============================================================
+# =========================================================
+# START SERVER
+# =========================================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get("PORT", 5000)
-    )
+    port = int(os.environ.get("PORT", 5000))
+
+    print("==============================================")
+    print("BYBIT WEBHOOK SERVER STARTING")
+    print("PORT:", port)
+    print("TESTNET:", TESTNET)
+    print("==============================================")
+
 
     app.run(
         host="0.0.0.0",
