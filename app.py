@@ -27,11 +27,11 @@ def webhook():
 
         print(f"--> ПОЛУЧЕН СИГНАЛ ОТ TRADINGVIEW: {data}")
 
-        symbol = data.get("symbol", "").replace(".P", "")
-        action = data.get("action")
+        symbol = data.get("symbol", "").replace(".P", "").strip()
+action = data.get("action", "").strip().lower()
 
-        if symbol and action:
-            side = "Buy" if action.lower() == "buy" else "Sell"
+       if action and symbol:
+    side = "Buy" if action == "buy" else "Sell"
             response = session.place_order(
                 category="linear",
                 symbol=symbol,
