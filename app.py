@@ -4,17 +4,15 @@ from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-# Инициализация клиента Bybit
 session = HTTP(
     testnet=False,
     api_key=os.environ.get("BYBIT_API_KEY"),
     api_secret=os.environ.get("BYBIT_API_SECRET")
 )
 
-# Этот маршрут нужен для UptimeRobot, он понимает и GET, и HEAD
 @app.route('/', methods=['GET', 'HEAD'])
 def home():
-    return "", 200
+    return "Bot is running", 200
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -38,7 +36,6 @@ def webhook():
     side = "Buy" if "buy" in action.lower() or "long" in action.lower() else "Sell"
 
     try:
-        # Для закрытия позиции (exit)
         if "exit" in action.lower() or "close" in action.lower():
             session.cancel_all_orders(category="linear", symbol=symbol)
             side_to_close = "Sell" if "long" in action.lower() else "Buy"
@@ -52,7 +49,6 @@ def webhook():
             )
             return jsonify({"status": "success", "response": response}), 200
 
-        # Для открытия позиции
         order_params = {
             "category": "linear",
             "symbol": symbol,
