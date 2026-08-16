@@ -1,4 +1,5 @@
 import os
+import json
 from flask import Flask, request, jsonify
 from pybit.unified_trading import HTTP
 
@@ -12,12 +13,11 @@ session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 @app.route("/", methods=["GET", "HEAD", "POST"])
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-   try:
-        # Пытаемся получить данные как JSON или принудительно парсим текст
+    try:
+        # Универсальный способ получения данных
         data = request.get_json(silent=True)
         if not data:
             if request.data:
-                import json
                 try:
                     data = json.loads(request.data.decode('utf-8'))
                 except:
@@ -29,8 +29,7 @@ def webhook():
 
         symbol = data.get("symbol")
         action = data.get("action")
-        action = data.get("action")
-        
+
         if symbol and action:
             side = "Buy" if action.lower() == "buy" else "Sell"
             response = session.place_order(
@@ -42,12 +41,12 @@ def webhook():
                 timeInForce="GoodTillCancel"
             )
             print(f"--> ОРДЕР УСПЕШНО ОТПРАВЛЕН НА BYBIT: {response}")
-        
-        return jsonify({"status": "success", "received_data": data}), 200
-        
+            return jsonify({"status": "success", "received_data": data}), 200
+        else:
+            return jsonify({"status": "error", "message": "Missing symbol or action"}), 400
+
     except Exception as e:
         print(f"--> ОШИБКА ОПЕРАЦИИ: {e}")
-        # Возвращаем 200 даже при ошибке ордера, чтобы TradingView больше никогда не писал 404/400
         return jsonify({"status": "error", "message": str(e)}), 200
 
 if __name__ == "__main__":
