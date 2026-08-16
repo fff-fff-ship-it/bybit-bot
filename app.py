@@ -12,14 +12,23 @@ session = HTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 @app.route("/", methods=["GET", "HEAD", "POST"])
 @app.route("/webhook", methods=["POST", "GET"])
 def webhook():
-    try:
+   try:
+        # Пытаемся получить данные как JSON или принудительно парсим текст
         data = request.get_json(silent=True)
-        if not data: 
-            data = request.form.to_dict()
-        
+        if not data:
+            if request.data:
+                import json
+                try:
+                    data = json.loads(request.data.decode('utf-8'))
+                except:
+                    data = {"raw": request.data.decode('utf-8')}
+            else:
+                data = request.form.to_dict()
+
         print(f"--> ПОЛУЧЕН СИГНАЛ ОТ TRADINGVIEW: {data}")
-        
+
         symbol = data.get("symbol")
+        action = data.get("action")
         action = data.get("action")
         
         if symbol and action:
