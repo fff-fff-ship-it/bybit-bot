@@ -3,16 +3,15 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET", "HEAD"])
-def index():
-    return jsonify({"status": "online"}), 200
-
-@app.route("/webhook", methods=["POST"])
+@app.route("/", methods=["GET", "HEAD", "POST"])
+@app.route("/webhook", methods=["POST", "GET"])
 def webhook():
     try:
         data = request.get_json(silent=True)
         if not data:
             data = request.form.to_dict()
+        if not data and request.data:
+            data = {"raw_data": request.data.decode('utf-8')}
         
         print(f"--> ПОЛУЧЕН СИГНАЛ ОТ TRADINGVIEW: {data}")
         
