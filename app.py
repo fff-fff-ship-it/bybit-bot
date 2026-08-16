@@ -27,24 +27,25 @@ def webhook():
 
         print(f"--> ПОЛУЧЕН СИГНАЛ ОТ TRADINGVIEW: {data}")
 
-        symbol = data.get("symbol", "").replace(".P", "").strip()
-        action = data.get("action", "").strip().lower()
+           data = symbol.get("symbol", "").replace(".P", "").strip()
+    action = action.get("action", "").strip().lower()
 
-       if action and symbol:
-         side = "Buy" if action == "buy" else "Sell"
-            response = session.place_order(
-                category="linear",
-                symbol=symbol,
-                side=side,
-                orderType="Market",
-                qty="1",
-                timeInForce="GoodTillCancel"
-            )
-            print(f"--> ОРДЕР УСПЕШНО ОТПРАВЛЕН НА BYBIT: {response}")
-            return jsonify({"status": "success", "received_data": data}), 200
-        else:
-            return jsonify({"status": "error", "message": "Missing symbol or action"}), 400
+    if symbol and action:
+        side = "Buy" if action == "buy" else "Sell"
 
+        response = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=side,
+            orderType="Market",
+            qty="1",
+            timeInForce="GoodTillCancel"
+        )
+
+        print(f"--> ОРДЕР УСПЕШНО ОТПРАВЛЕН НА BYBIT: {response}")
+        return jsonify({"status": "success", "received_data": data}), 200
+    else:
+        return jsonify({"status": "ошибка", "сообщение": "Отсутствует символ или действие"}), 400
     except Exception as e:
         print(f"--> ОШИБКА ОПЕРАЦИИ: {e}")
         return jsonify({"status": "error", "message": str(e)}), 200
