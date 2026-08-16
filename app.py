@@ -27,7 +27,7 @@ def webhook():
 
         print(f"--> ПОЛУЧЕН СИГНАЛ ОТ TRADINGVIEW: {data}")
 
-        symbol = data.get("symbol")
+        symbol = data.get("symbol", "").replace(".P", "")
         action = data.get("action")
 
         if symbol and action:
