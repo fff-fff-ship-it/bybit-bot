@@ -19,7 +19,7 @@ session = HTTP(
 # =========================
 # НАСТРОЙКИ СТРАТЕГИИ
 # =========================
-CAPITAL_PERCENT = 0.2  # 20% от депозита на 1 монету ($20 из $100)
+CAPITAL_PERCENT = 0.2  # 20% от депозита на 1 монету
 LEVERAGE = 10          # Плечо 10x
 
 
@@ -49,7 +49,6 @@ def get_position(symbol):
 
 
 def calculate_quantity(symbol, price):
-    # Получаем реальный баланс USDT с кошелька Bybit
     wallet_balance = 0.0
     try:
         wallet_resp = session.get_wallet_balance(
@@ -62,15 +61,12 @@ def calculate_quantity(symbol, price):
     except Exception as e:
         print(f"--> Ошибка получения баланса: {e}, используем дефолт")
 
-    # Если баланс не отдался, берем ваши стартовые 100 долларов для страховки
     if wallet_balance <= 0:
         wallet_balance = 100.0
 
-    # Расчет суммы позиции: Баланс * 20% * Плечо 10x
     target_position_usdt = wallet_balance * CAPITAL_PERCENT * LEVERAGE
     raw_qty = target_position_usdt / price
 
-    # Получаем правила шага лота от Bybit
     response = session.get_instruments_info(
         category="linear",
         symbol=symbol
@@ -86,7 +82,6 @@ def calculate_quantity(symbol, price):
     if qty_step <= 0:
         qty_step = 1
 
-    # Округляем по правилам биржи
     qty = math.floor(raw_qty / qty_step) * qty_step
     if qty < min_qty:
         qty = min_qty
@@ -103,7 +98,6 @@ def open_long(symbol):
             print(f"--> LONG УЖЕ ОТКРЫТ: {symbol}, qty={current_size}")
             return {"status": "already_open", "symbol": symbol, "qty": current_size}
 
-    # Получаем актуальную цену
     tickers = session.get_tickers(category="linear", symbol=symbol)
     items = tickers.get("result", {}).get("list", [])
     if not items:
