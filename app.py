@@ -23,15 +23,15 @@ session = HTTP(
 # НАСТРОЙКИ СТРАТЕГИИ
 # =========================
 
-MARGIN_PERCENT = 0.05       # 5% текущего equity
-LEVERAGE = 3                # x3 плечо
+MARGIN_PERCENT = 0.05
+LEVERAGE = 3
 ACCOUNT_COIN = "USDT"
 
 trade_lock = threading.Lock()
 
 
 # =========================
-# НОРМАЛИЗАЦИЯ СИМВОЛА
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =========================
 
 def normalize_symbol(symbol):
@@ -44,10 +44,6 @@ def normalize_symbol(symbol):
         symbol = symbol[:-2]
     return symbol
 
-
-# =========================
-# ПОЛУЧЕНИЕ EQUITY
-# =========================
 
 def get_current_equity():
     response = session.get_wallet_balance(
@@ -66,10 +62,6 @@ def get_current_equity():
         raise Exception(f"Некорректный equity Bybit: {total_equity}")
     return total_equity
 
-
-# =========================
-# РАБОТА С ПОЗИЦИЯМИ
-# =========================
 
 def get_position(symbol):
     response = session.get_positions(
@@ -139,27 +131,34 @@ def calculate_quantity(symbol, price):
 # =========================
 
 def execute_signal(symbol, target_side):
-    """
-    Универсальная логика: открывает позицию нужного направления 
-    или переворачивает существующую с учетом reduceOnly.
-    """
     with trade_lock:
+        # 1. Жестко выставляем нужное плечо перед сделкой
+        try:
+            session.set_leverage(
+                category="linear",
+                symbol=symbol,
+                buyLeverage=str(LEVERAGE),
+                sellLeverage=str(LEVERAGE)
+            )
+        except Exception as e:
+            print(f"--> Плечо уже установлено или ошибка: {e}")
+
+        # 2. Проверяем текущую позицию
         position = get_position(symbol)
         
         if position:
-            current_side = position.get("side") # "Buy" или "Sell"
+            current_side = position.get("side")
             current_size = position.get("size")
             
-            # Если уже стоим в нужном направлении — ничего не делаем
             if current_side == target_side:
-                print(f"--> Позиция {symbol} уже в {target_side}, игнорируем.")
+                print(f"--> Позиция {symbol} уже в {target_side}, пропускаем.")
                 return {"status": "ignored", "message": "Already in position"}
 
-            # Если направление противоположное — закрываем текущую перед открытием новой
+            # Закрываем старую противоположную позицию рынком
             closing_side = "Sell" if current_side == "Buy" else "Buy"
-            print(f"--> Переворот позиции по {symbol}: закрываем {current_side}, открываем {target_side}")
+            print(f"--> Закрываем текущую позицию {current_side} по {symbol}, объем: {current_size}")
             
-            session.place_order(
+            close_resp = session.place_order(
                 category="linear",
                 symbol=symbol,
                 side=closing_side,
@@ -168,8 +167,9 @@ def execute_signal(symbol, target_side):
                 reduceOnly=True,
                 positionIdx=0
             )
+            print(f"--> Ответ закрытия: {close_resp}")
 
-        # Открываем новую позицию (или входим с нуля)
+        # 3. Открываем новую позицию
         price = get_price(symbol)
         qty = calculate_quantity(symbol, price)
 
@@ -228,17 +228,14 @@ def webhook():
         if not symbol:
             return jsonify({"status": "error", "message": "Не указан symbol"}), 400
 
-        # Обработка Лонга
         if action in ["buy", "купить", "long"]:
             result = execute_signal(symbol, "Buy")
             return jsonify(result), 200
 
-        # Обработка Шорта
         if action in ["sell", "продать", "short"]:
             result = execute_signal(symbol, "Sell")
             return jsonify(result), 200
 
-        # Обработка закрытия
         if action in ["exit", "close", "закрыть"]:
             result = close_position(symbol)
             return jsonify(result), 200
