@@ -1,131 +1,98 @@
-"""
-Heikin Ashi RSI 33 — Bybit Bot
-
-Strategy logic:
-    1. No position:
-       RSI(14) < 33 + new green Heikin-Ashi candle -> LONG
-
-    2. LONG:
-       new red Heikin-Ashi candle -> reverse to SHORT
-
-    3. SHORT:
-       new green Heikin-Ashi candle -> CLOSE SHORT
-
-Position sizing:
-    5% of current Bybit Unified Account equity × 3 leverage
-
-Important:
-    - One position maximum for the entire account.
-    - No Take Profit.
-    - No Stop Loss.
-    - No TradingView webhook required.
-    - Strategy logic runs directly in Python.
-"""
-
 import os
 import time
-import logging
-from decimal import Decimal, ROUND_DOWN
-from typing import Optional, Dict, Any, List
-
+import math
+import threading
+from flask import Flask, jsonify
 from pybit.unified_trading import HTTP
 
 
 # ============================================================
-# CONFIGURATION
+# APP
 # ============================================================
 
-API_KEY = os.getenv("BYBIT_API_KEY")
-API_SECRET = os.getenv("BYBIT_API_SECRET")
+app = Flask(__name__)
 
-# Real Bybit account by default.
-# Set BYBIT_TESTNET=true in Render if you want testnet.
-BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
 
-# Symbols separated by commas:
+# ============================================================
+# BYBIT API
+# ============================================================
+
+API_KEY = os.environ.get("BYBIT_API_KEY")
+API_SECRET = os.environ.get("BYBIT_API_SECRET")
+
+if not API_KEY or not API_SECRET:
+    raise Exception("BYBIT_API_KEY / BYBIT_API_SECRET не заданы")
+
+
+TESTNET = os.environ.get("BYBIT_TESTNET", "false").lower() == "true"
+
+session = HTTP(
+    testnet=TESTNET,
+    api_key=API_KEY,
+    api_secret=API_SECRET
+)
+
+
+# ============================================================
+# НАСТРОЙКИ СТРАТЕГИИ
+# ============================================================
+
+RSI_LENGTH = 14
+RSI_ENTRY = 33
+
+TIMEFRAME = os.environ.get("TIMEFRAME", "5")
+
+# 5% текущего equity
+EQUITY_PERCENT = 0.05
+
+# Плечо 3x
+LEVERAGE = 3
+
+
+# ============================================================
+# НАСТРОЙКИ БОТА
+# ============================================================
+
+POLL_SECONDS = int(
+    os.environ.get("POLL_SECONDS", "10")
+)
+
+# Например:
 # BTCUSDT,ETHUSDT,SOLUSDT
 SYMBOLS = [
     symbol.strip().upper()
-    for symbol in os.getenv(
+    for symbol in os.environ.get(
         "SYMBOLS",
         "BTCUSDT"
     ).split(",")
     if symbol.strip()
 ]
 
-# Trading timeframe.
-# Bybit interval "5" = 5 minutes.
-INTERVAL = os.getenv("INTERVAL", "5")
 
-# How often the bot checks the market.
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+# ============================================================
+# ЗАЩИТА ОТ ОДНОВРЕМЕННЫХ ОПЕРАЦИЙ
+# ============================================================
 
-# Strategy parameters.
-RSI_LENGTH = 14
-RSI_ENTRY = 33
-
-# Position sizing.
-MARGIN_PERCENT = Decimal("0.05")
-LEVERAGE = Decimal("3")
-
-# Number of candles used for calculations.
-KLINE_LIMIT = 200
-
-# Bybit Unified Account.
-CATEGORY = "linear"
-ACCOUNT_TYPE = "UNIFIED"
-SETTLE_COIN = "USDT"
+trade_lock = threading.Lock()
 
 
 # ============================================================
-# LOGGING
+# ПОСЛЕДНЯЯ ОБРАБОТАННАЯ СВЕЧА
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger("heikin-ashi-bot")
+last_processed_candle = {}
 
 
 # ============================================================
-# BYBIT SESSION
+# НОРМАЛИЗАЦИЯ SYMBOL
 # ============================================================
 
-if not API_KEY or not API_SECRET:
-    raise RuntimeError(
-        "BYBIT_API_KEY and BYBIT_API_SECRET must be set "
-        "in environment variables."
-    )
+def normalize_symbol(symbol):
 
-session = HTTP(
-    testnet=BYBIT_TESTNET,
-    api_key=API_KEY,
-    api_secret=API_SECRET,
-)
+    if not symbol:
+        return ""
 
-
-# ============================================================
-# INTERNAL STATE
-# ============================================================
-
-# Last closed candle processed for each symbol.
-last_processed_candle: Dict[str, int] = {}
-
-# Instrument information cache.
-instrument_cache: Dict[str, Dict[str, Decimal]] = {}
-
-
-# ============================================================
-# BASIC HELPERS
-# ============================================================
-
-def normalize_symbol(symbol: str) -> str:
-    """
-    Converts symbols to Bybit format.
-    """
-    symbol = symbol.upper().strip()
+    symbol = str(symbol).strip().upper()
 
     if ":" in symbol:
         symbol = symbol.split(":")[-1]
@@ -136,743 +103,1132 @@ def normalize_symbol(symbol: str) -> str:
     return symbol
 
 
-def decimal_places(step: Decimal) -> int:
-    """
-    Returns number of decimal places required by a quantity step.
-    """
-    exponent = step.as_tuple().exponent
-    return max(0, -exponent)
-
-
-def round_qty(qty: Decimal, step: Decimal) -> Decimal:
-    """
-    Rounds quantity DOWN to Bybit qtyStep.
-    """
-    if step <= 0:
-        return qty
-
-    units = (qty / step).to_integral_value(
-        rounding=ROUND_DOWN
-    )
-
-    result = units * step
-
-    places = decimal_places(step)
-
-    return result.quantize(
-        Decimal("1").scaleb(-places)
-    )
-
-
 # ============================================================
-# ACCOUNT
+# ПОЛУЧЕНИЕ CURRENT EQUITY
 # ============================================================
 
-def get_current_equity() -> Decimal:
-    """
-    Gets current total equity from Bybit Unified Account.
-
-    Bybit's totalEquity includes account equity and
-    unrealized PnL.
-    """
+def get_current_equity():
 
     response = session.get_wallet_balance(
-        accountType=ACCOUNT_TYPE,
-        coin=SETTLE_COIN,
+        accountType="UNIFIED",
+        coin="USDT"
     )
 
-    result = response["result"]["list"]
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                "Ошибка получения баланса"
+            )
+        )
 
-    if not result:
-        raise RuntimeError("Unable to read Bybit account equity.")
+    result = response.get(
+        "result",
+        {}
+    )
 
-    equity = Decimal(result[0]["totalEquity"])
+    accounts = result.get(
+        "list",
+        []
+    )
+
+    if not accounts:
+        raise Exception(
+            "Bybit не вернул данные Unified Account"
+        )
+
+    account = accounts[0]
+
+    equity = float(
+        account.get(
+            "totalEquity",
+            "0"
+        ) or 0
+    )
 
     if equity <= 0:
-        raise RuntimeError(
-            f"Invalid account equity: {equity}"
+
+        # Запасной вариант
+        coin_list = account.get(
+            "coin",
+            []
+        )
+
+        for coin in coin_list:
+
+            if coin.get("coin") == "USDT":
+
+                equity = float(
+                    coin.get(
+                        "equity",
+                        "0"
+                    ) or 0
+                )
+
+                break
+
+    if equity <= 0:
+        raise Exception(
+            "Current equity <= 0"
         )
 
     return equity
 
 
 # ============================================================
-# POSITION
+# ПОЛУЧЕНИЕ ТЕКУЩЕЙ ЦЕНЫ
 # ============================================================
 
-def get_open_position() -> Optional[Dict[str, Any]]:
-    """
-    Returns the first open linear position on the entire account.
+def get_price(symbol):
 
-    IMPORTANT:
-    We intentionally do NOT check only one symbol.
-
-    This implements:
-        ONE POSITION MAXIMUM FOR THE WHOLE ACCOUNT.
-    """
-
-    response = session.get_positions(
-        category=CATEGORY,
-        settleCoin=SETTLE_COIN,
+    response = session.get_tickers(
+        category="linear",
+        symbol=symbol
     )
 
-    positions = response["result"]["list"]
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Ошибка цены {symbol}"
+            )
+        )
+
+    items = response.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
+
+    if not items:
+        raise Exception(
+            f"Цена {symbol} не найдена"
+        )
+
+    return float(
+        items[0]["lastPrice"]
+    )
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ ВСЕХ ОТКРЫТЫХ ПОЗИЦИЙ
+# ============================================================
+
+def get_account_position():
+
+    response = session.get_positions(
+        category="linear",
+        settleCoin="USDT"
+    )
+
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                "Ошибка получения позиций"
+            )
+        )
+
+    positions = response.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
 
     for position in positions:
 
-        size = Decimal(position.get("size", "0"))
+        side = position.get(
+            "side",
+            ""
+        )
 
-        if size > 0:
-            return position
+        size = float(
+            position.get(
+                "size",
+                "0"
+            ) or 0
+        )
+
+        if size > 0 and side in ["Buy", "Sell"]:
+
+            return {
+                "symbol": normalize_symbol(
+                    position.get("symbol")
+                ),
+                "side": side,
+                "size": size,
+                "positionIdx": position.get(
+                    "positionIdx",
+                    0
+                )
+            }
 
     return None
 
 
 # ============================================================
-# INSTRUMENT INFORMATION
+# ПОЛУЧЕНИЕ ИНФОРМАЦИИ ОБ ИНСТРУМЕНТЕ
 # ============================================================
 
-def get_instrument_info(symbol: str) -> Dict[str, Decimal]:
-    """
-    Gets Bybit quantity rules for a symbol.
-    """
-
-    symbol = normalize_symbol(symbol)
-
-    if symbol in instrument_cache:
-        return instrument_cache[symbol]
+def get_instrument_info(symbol):
 
     response = session.get_instruments_info(
-        category=CATEGORY,
-        symbol=symbol,
+        category="linear",
+        symbol=symbol
     )
 
-    instruments = response["result"]["list"]
-
-    if not instruments:
-        raise RuntimeError(
-            f"Instrument not found on Bybit: {symbol}"
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Ошибка информации {symbol}"
+            )
         )
 
-    instrument = instruments[0]
-    lot = instrument["lotSizeFilter"]
+    instruments = response.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
 
-    info = {
-        "qty_step": Decimal(lot["qtyStep"]),
-        "min_qty": Decimal(lot["minOrderQty"]),
-        "min_notional": Decimal(
-            lot.get("minNotionalValue", "0")
-        ),
-        "max_market_qty": Decimal(
-            lot.get(
-                "maxMktOrderQty",
-                "999999999"
-            )
-        ),
-    }
+    if not instruments:
+        raise Exception(
+            f"Bybit не нашёл инструмент {symbol}"
+        )
 
-    instrument_cache[symbol] = info
-
-    return info
+    return instruments[0]
 
 
 # ============================================================
-# QUANTITY CALCULATION
+# ОКРУГЛЕНИЕ QTY
 # ============================================================
 
-def calculate_position_quantity(
-    symbol: str,
-    price: Decimal,
-) -> Decimal:
-    """
-    Strategy sizing:
+def calculate_quantity(symbol, price):
 
-        5% equity = margin
-        margin × 3 = position value
-        position value / price = coin quantity
-    """
+    # --------------------------------------------------------
+    # CURRENT EQUITY
+    # --------------------------------------------------------
 
     equity = get_current_equity()
 
-    margin_amount = equity * MARGIN_PERCENT
+    # --------------------------------------------------------
+    # 5% EQUITY
+    # --------------------------------------------------------
 
-    position_value = margin_amount * LEVERAGE
+    margin_amount = equity * EQUITY_PERCENT
 
-    raw_qty = position_value / price
+    # --------------------------------------------------------
+    # 5% × 3x
+    # --------------------------------------------------------
 
-    info = get_instrument_info(symbol)
+    position_usdt = margin_amount * LEVERAGE
 
-    qty = round_qty(
-        raw_qty,
-        info["qty_step"],
+    # --------------------------------------------------------
+    # QTY COIN
+    # --------------------------------------------------------
+
+    raw_qty = position_usdt / price
+
+    # --------------------------------------------------------
+    # ПАРАМЕТРЫ ИНСТРУМЕНТА
+    # --------------------------------------------------------
+
+    instrument = get_instrument_info(
+        symbol
     )
 
-    if qty < info["min_qty"]:
-        raise RuntimeError(
-            f"{symbol}: calculated quantity {qty} "
-            f"is below Bybit minimum {info['min_qty']}"
+    lot_filter = instrument.get(
+        "lotSizeFilter",
+        {}
+    )
+
+    min_qty = float(
+        lot_filter.get(
+            "minOrderQty",
+            "0"
+        ) or 0
+    )
+
+    qty_step = float(
+        lot_filter.get(
+            "qtyStep",
+            "1"
+        ) or 1
+    )
+
+    max_qty = float(
+        lot_filter.get(
+            "maxOrderQty",
+            "0"
+        ) or 0
+    )
+
+    # --------------------------------------------------------
+    # ОКРУГЛЕНИЕ ВНИЗ
+    # --------------------------------------------------------
+
+    if qty_step <= 0:
+        qty_step = 1
+
+    qty = math.floor(
+        raw_qty / qty_step
+    ) * qty_step
+
+    # --------------------------------------------------------
+    # MIN QTY
+    # --------------------------------------------------------
+
+    if qty < min_qty:
+        qty = min_qty
+
+    # --------------------------------------------------------
+    # MAX QTY
+    # --------------------------------------------------------
+
+    if max_qty > 0 and qty > max_qty:
+        qty = max_qty
+
+    if qty <= 0:
+        raise Exception(
+            f"Некорректный qty для {symbol}"
         )
 
-    if qty > info["max_market_qty"]:
-        qty = round_qty(
-            info["max_market_qty"],
-            info["qty_step"],
-        )
+    qty_string = format(
+        qty,
+        ".12f"
+    ).rstrip("0").rstrip(".")
 
-    notional = qty * price
+    print(
+        f"--> EQUITY: ${equity:.2f}"
+    )
 
-    if notional < info["min_notional"]:
-        raise RuntimeError(
-            f"{symbol}: order value {notional} "
-            f"is below minimum notional "
-            f"{info['min_notional']}"
-        )
+    print(
+        f"--> 5% MARGIN: ${margin_amount:.2f}"
+    )
 
-    return qty
+    print(
+        f"--> POSITION 3x: ${position_usdt:.2f}"
+    )
+
+    print(
+        f"--> PRICE: {price}"
+    )
+
+    print(
+        f"--> QTY: {qty_string}"
+    )
+
+    return qty_string
 
 
 # ============================================================
-# MARKET DATA
+# УСТАНОВКА ПЛЕЧА 3x
 # ============================================================
 
-def get_closed_klines(
-    symbol: str,
-) -> List[List[str]]:
-    """
-    Returns recent closed candles.
+def set_leverage(symbol):
 
-    Bybit returns candles newest first.
-    We reverse them so calculations run oldest -> newest.
-    """
+    try:
+
+        response = session.set_leverage(
+            category="linear",
+            symbol=symbol,
+            buyLeverage=str(LEVERAGE),
+            sellLeverage=str(LEVERAGE)
+        )
+
+        if response.get("retCode") == 0:
+
+            print(
+                f"--> LEVERAGE {symbol}: {LEVERAGE}x"
+            )
+
+        else:
+
+            print(
+                f"--> LEVERAGE {symbol}: "
+                f"{response.get('retMsg')}"
+            )
+
+    except Exception as e:
+
+        print(
+            f"--> LEVERAGE ERROR {symbol}: {e}"
+        )
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ 5M CANDLES
+# ============================================================
+
+def get_closed_candles(symbol, limit=100):
 
     response = session.get_kline(
-        category=CATEGORY,
+        category="linear",
         symbol=symbol,
-        interval=INTERVAL,
-        limit=KLINE_LIMIT,
+        interval=TIMEFRAME,
+        limit=limit
     )
 
-    candles = response["result"]["list"]
-
-    if not candles:
-        raise RuntimeError(
-            f"No candles returned for {symbol}"
+    if response.get("retCode") != 0:
+        raise Exception(
+            response.get(
+                "retMsg",
+                f"Ошибка свечей {symbol}"
+            )
         )
 
+    candles = response.get(
+        "result",
+        {}
+    ).get(
+        "list",
+        []
+    )
+
+    if not candles:
+        raise Exception(
+            f"Нет свечей {symbol}"
+        )
+
+    # Bybit возвращает от новых к старым
     candles = list(reversed(candles))
 
-    # Last candle may still be forming.
-    # We remove it and work only with closed candles.
-    candles = candles[:-1]
+    # Последняя свеча может быть текущей,
+    # поэтому её не используем.
+    if len(candles) > 1:
+        candles = candles[:-1]
 
-    return candles
+    result = []
+
+    for candle in candles:
+
+        result.append({
+            "time": int(candle[0]),
+            "open": float(candle[1]),
+            "high": float(candle[2]),
+            "low": float(candle[3]),
+            "close": float(candle[4])
+        })
+
+    return result
 
 
 # ============================================================
-# RSI
+# RSI — WILDER / TV STYLE
 # ============================================================
 
-def calculate_rsi(
-    closes: List[float],
-    length: int,
-) -> List[Optional[float]]:
-    """
-    Wilder RSI calculation.
+def calculate_rsi(closes, length=14):
 
-    Equivalent to TradingView ta.rsi()
-    for the strategy logic.
-    """
-
-    if len(closes) < length + 1:
-        return [None] * len(closes)
-
-    rsi_values: List[Optional[float]] = [
-        None
-    ] * len(closes)
+    if len(closes) <= length:
+        return None
 
     gains = []
     losses = []
 
-    for i in range(1, length + 1):
+    for i in range(1, len(closes)):
 
         change = closes[i] - closes[i - 1]
 
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
 
-    avg_gain = sum(gains) / length
-    avg_loss = sum(losses) / length
+        else:
+            gains.append(0.0)
+            losses.append(abs(change))
 
-    if avg_loss == 0:
-        rsi_values[length] = 100.0
+    avg_gain = sum(
+        gains[:length]
+    ) / length
 
-    else:
-        rs = avg_gain / avg_loss
+    avg_loss = sum(
+        losses[:length]
+    ) / length
 
-        rsi_values[length] = (
-            100.0 - (100.0 / (1.0 + rs))
-        )
+    rsi_values = [
+        None
+    ] * length
 
-    for i in range(length + 1, len(closes)):
+    # --------------------------------------------------------
+    # Дальше Wilder RMA
+    # --------------------------------------------------------
 
-        change = closes[i] - closes[i - 1]
-
-        gain = max(change, 0.0)
-        loss = max(-change, 0.0)
+    for i in range(length, len(gains)):
 
         avg_gain = (
-            (avg_gain * (length - 1)) + gain
+            (avg_gain * (length - 1))
+            + gains[i]
         ) / length
 
         avg_loss = (
-            (avg_loss * (length - 1)) + loss
+            (avg_loss * (length - 1))
+            + losses[i]
         ) / length
 
         if avg_loss == 0:
-            rsi_values[i] = 100.0
+
+            rsi = 100.0
 
         else:
+
             rs = avg_gain / avg_loss
 
-            rsi_values[i] = (
-                100.0 - (100.0 / (1.0 + rs))
+            rsi = 100.0 - (
+                100.0 / (1.0 + rs)
             )
 
-    return rsi_values
+        rsi_values.append(rsi)
+
+    return rsi_values[-1]
 
 
 # ============================================================
 # HEIKIN ASHI
 # ============================================================
 
-def calculate_heikin_ashi(
-    candles: List[List[str]],
-) -> Dict[str, Any]:
-    """
-    Calculates Heikin-Ashi exactly from normal OHLC candles.
+def calculate_heikin_ashi(candles):
 
-    HA close:
-        (O + H + L + C) / 4
+    ha_open = None
 
-    HA open:
-        first candle:
-            (O + C) / 2
-
-        following candles:
-            (previous HA open + previous HA close) / 2
-    """
-
-    ha_opens = []
-    ha_closes = []
-    green = []
-    red = []
-
-    previous_ha_open = None
-    previous_ha_close = None
+    result = []
 
     for candle in candles:
 
-        open_price = float(candle[1])
-        high_price = float(candle[2])
-        low_price = float(candle[3])
-        close_price = float(candle[4])
+        o = candle["open"]
+        h = candle["high"]
+        l = candle["low"]
+        c = candle["close"]
+
+        # Pine:
+        # ha_close = (open + high + low + close) / 4
 
         ha_close = (
-            open_price
-            + high_price
-            + low_price
-            + close_price
+            o + h + l + c
         ) / 4.0
 
-        if previous_ha_open is None:
+        # Pine:
+        # ha_open := na(ha_open[1])
+        # ? (open + close) / 2
+        # : (ha_open[1] + ha_close[1]) / 2
+
+        if ha_open is None:
+
             ha_open = (
-                open_price + close_price
+                o + c
             ) / 2.0
 
         else:
+
+            previous_ha_close = result[-1][
+                "ha_close"
+            ]
+
             ha_open = (
-                previous_ha_open
+                ha_open
                 + previous_ha_close
             ) / 2.0
 
-        ha_opens.append(ha_open)
-        ha_closes.append(ha_close)
+        ha_green = (
+            ha_close > ha_open
+        )
 
-        green.append(ha_close > ha_open)
-        red.append(ha_close < ha_open)
+        ha_red = (
+            ha_close < ha_open
+        )
 
-        previous_ha_open = ha_open
-        previous_ha_close = ha_close
+        result.append({
+            "time": candle["time"],
+            "ha_open": ha_open,
+            "ha_close": ha_close,
+            "green": ha_green,
+            "red": ha_red
+        })
 
-    return {
-        "open": ha_opens,
-        "close": ha_closes,
-        "green": green,
-        "red": red,
-    }
+    return result
 
 
 # ============================================================
-# STRATEGY SIGNAL
+# АНАЛИЗ СТРАТЕГИИ
 # ============================================================
 
-def get_signal(
-    symbol: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    Calculates the signal on the latest CLOSED candle.
+def analyze_symbol(symbol):
 
-    Returns:
+    candles = get_closed_candles(
+        symbol,
+        limit=100
+    )
 
-        LONG
-        SHORT
-        CLOSE_SHORT
-        None
-    """
-
-    candles = get_closed_klines(symbol)
-
-    if len(candles) < RSI_LENGTH + 2:
+    if len(candles) < RSI_LENGTH + 5:
         return None
 
     closes = [
-        float(candle[4])
+        candle["close"]
         for candle in candles
     ]
 
-    rsi_values = calculate_rsi(
+    rsi = calculate_rsi(
         closes,
-        RSI_LENGTH,
+        RSI_LENGTH
     )
 
-    ha = calculate_heikin_ashi(candles)
+    ha = calculate_heikin_ashi(
+        candles
+    )
 
-    index = len(candles) - 1
-    previous = index - 1
-
-    current_rsi = rsi_values[index]
-
-    if current_rsi is None:
+    if len(ha) < 2:
         return None
 
-    current_green = ha["green"][index]
-    current_red = ha["red"][index]
+    current = ha[-1]
+    previous = ha[-2]
 
-    previous_green = ha["green"][previous]
-    previous_red = ha["red"][previous]
+    # --------------------------------------------------------
+    # EXACT PINE LOGIC
+    # --------------------------------------------------------
 
-    # TradingView logic:
-    #
-    # green trigger:
-    # green now AND NOT green previously
-    #
-    # red trigger:
-    # red now AND NOT red previously
-
-    green_trigger = (
-        current_green
-        and not previous_green
+    ha_green_trig = (
+        current["green"]
+        and not previous["green"]
     )
 
-    red_trigger = (
-        current_red
-        and not previous_red
+    ha_red_trig = (
+        current["red"]
+        and not previous["red"]
     )
 
-    candle_timestamp = int(candles[index][0])
-
-    close_price = Decimal(
-        candles[index][4]
+    long_condition = (
+        rsi is not None
+        and rsi < RSI_ENTRY
+        and ha_green_trig
     )
 
     return {
         "symbol": symbol,
-        "timestamp": candle_timestamp,
-        "price": close_price,
-        "rsi": current_rsi,
-        "green_trigger": green_trigger,
-        "red_trigger": red_trigger,
+        "candle_time": current["time"],
+        "rsi": rsi,
+        "ha_green": current["green"],
+        "ha_red": current["red"],
+        "ha_green_trig": ha_green_trig,
+        "ha_red_trig": ha_red_trig,
+        "long_condition": long_condition
     }
 
 
 # ============================================================
-# ORDERS
+# OPEN LONG
 # ============================================================
 
-def open_long(
-    symbol: str,
-    price: Decimal,
-) -> None:
+def open_long(symbol):
 
-    qty = calculate_position_quantity(
-        symbol,
-        price,
-    )
+    with trade_lock:
 
-    logger.info(
-        "OPEN LONG | %s | qty=%s | price=%s",
-        symbol,
-        qty,
-        price,
+        # ----------------------------------------------------
+        # ACCOUNT-WIDE POSITION CHECK
+        # ----------------------------------------------------
+
+        position = get_account_position()
+
+        if position:
+
+            print(
+                f"--> ПОЗИЦИЯ УЖЕ ЕСТЬ: "
+                f"{position['symbol']} "
+                f"{position['side']} "
+                f"qty={position['size']}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # PRICE
+        # ----------------------------------------------------
+
+        price = get_price(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # LEVERAGE
+        # ----------------------------------------------------
+
+        set_leverage(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # QTY
+        # ----------------------------------------------------
+
+        qty = calculate_quantity(
+            symbol,
+            price
+        )
+
+        # ----------------------------------------------------
+        # OPEN LONG
+        # ----------------------------------------------------
+
+        print(
+            f"--> ОТКРЫВАЕМ LONG: "
+            f"{symbol}, qty={qty}"
+        )
+
+        response = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side="Buy",
+            orderType="Market",
+            qty=qty,
+            timeInForce="GoodTillCancel",
+            positionIdx=0
+        )
+
+        print(
+            f"--> LONG RESPONSE: {response}"
+        )
+
+        if response.get("retCode") != 0:
+
+            raise Exception(
+                response.get(
+                    "retMsg",
+                    "Ошибка открытия LONG"
+                )
+            )
+
+
+# ============================================================
+# CLOSE LONG
+# ============================================================
+
+def close_long(symbol):
+
+    position = get_account_position()
+
+    if not position:
+        print(
+            "--> LONG НЕ НАЙДЕН"
+        )
+        return False
+
+    if position["side"] != "Buy":
+        return False
+
+    current_symbol = position["symbol"]
+    current_size = position["size"]
+
+    print(
+        f"--> ЗАКРЫВАЕМ LONG: "
+        f"{current_symbol}, "
+        f"qty={current_size}"
     )
 
     response = session.place_order(
-        category=CATEGORY,
-        symbol=symbol,
-        side="Buy",
-        orderType="Market",
-        qty=str(qty),
-        positionIdx=0,
-        reduceOnly=False,
-        orderLinkId=f"HA_LONG_{int(time.time())}",
-    )
-
-    logger.info(
-        "LONG ORDER RESPONSE: %s",
-        response,
-    )
-
-
-def open_short(
-    symbol: str,
-    price: Decimal,
-) -> None:
-
-    qty = calculate_position_quantity(
-        symbol,
-        price,
-    )
-
-    logger.info(
-        "OPEN SHORT | %s | qty=%s | price=%s",
-        symbol,
-        qty,
-        price,
-    )
-
-    response = session.place_order(
-        category=CATEGORY,
-        symbol=symbol,
+        category="linear",
+        symbol=current_symbol,
         side="Sell",
         orderType="Market",
-        qty=str(qty),
-        positionIdx=0,
-        reduceOnly=False,
-        orderLinkId=f"HA_SHORT_{int(time.time())}",
-    )
-
-    logger.info(
-        "SHORT ORDER RESPONSE: %s",
-        response,
-    )
-
-
-def close_position(
-    position: Dict[str, Any],
-) -> None:
-
-    symbol = position["symbol"]
-    side = position["side"]
-    size = Decimal(position["size"])
-
-    if side == "Buy":
-        close_side = "Sell"
-    else:
-        close_side = "Buy"
-
-    logger.info(
-        "CLOSE POSITION | %s | side=%s | size=%s",
-        symbol,
-        side,
-        size,
-    )
-
-    response = session.place_order(
-        category=CATEGORY,
-        symbol=symbol,
-        side=close_side,
-        orderType="Market",
-        qty=str(size),
-        positionIdx=0,
+        qty=str(current_size),
         reduceOnly=True,
-        orderLinkId=f"HA_CLOSE_{int(time.time())}",
+        positionIdx=0
     )
 
-    logger.info(
-        "CLOSE ORDER RESPONSE: %s",
-        response,
+    print(
+        f"--> CLOSE LONG RESPONSE: "
+        f"{response}"
     )
 
+    if response.get("retCode") != 0:
 
-# ============================================================
-# STRATEGY ENGINE
-# ============================================================
-
-def process_symbol(symbol: str) -> None:
-
-    symbol = normalize_symbol(symbol)
-
-    signal = get_signal(symbol)
-
-    if signal is None:
-        return
-
-    candle_timestamp = signal["timestamp"]
-
-    # --------------------------------------------------------
-    # Prevent duplicate processing
-    # --------------------------------------------------------
-
-    if last_processed_candle.get(symbol) == candle_timestamp:
-        return
-
-    # Mark this candle as processed before trading.
-    last_processed_candle[symbol] = candle_timestamp
-
-    logger.info(
-        "%s | candle=%s | RSI=%.2f | green=%s | red=%s",
-        symbol,
-        candle_timestamp,
-        signal["rsi"],
-        signal["green_trigger"],
-        signal["red_trigger"],
-    )
-
-    # --------------------------------------------------------
-    # CRITICAL:
-    # Only one position on the entire account.
-    # --------------------------------------------------------
-
-    position = get_open_position()
-
-    # ========================================================
-    # NO POSITION
-    # ========================================================
-
-    if position is None:
-
-        # Original Pine logic:
-        #
-        # RSI < 33
-        # AND
-        # new green HA candle
-        #
-        # -> LONG
-
-        if (
-            signal["rsi"] < RSI_ENTRY
-            and signal["green_trigger"]
-        ):
-
-            open_long(
-                symbol,
-                signal["price"],
+        raise Exception(
+            response.get(
+                "retMsg",
+                "Ошибка закрытия LONG"
             )
+        )
 
-        return
+    return True
 
-    # ========================================================
-    # POSITION EXISTS
-    # ========================================================
 
-    position_symbol = normalize_symbol(
-        position["symbol"]
-    )
+# ============================================================
+# OPEN SHORT
+# ============================================================
 
-    position_side = position["side"]
+def open_short(symbol):
 
-    # --------------------------------------------------------
-    # LONG -> SHORT
-    # --------------------------------------------------------
+    with trade_lock:
 
-    if position_side == "Buy":
+        # ----------------------------------------------------
+        # ПРОВЕРЯЕМ LONG
+        # ----------------------------------------------------
 
-        if signal["symbol"] != position_symbol:
+        position = get_account_position()
+
+        if not position:
+            print(
+                "--> LONG НЕ НАЙДЕН. "
+                "SHORT НЕ ОТКРЫВАЕМ."
+            )
             return
 
-        if signal["red_trigger"]:
+        if position["side"] != "Buy":
 
-            logger.info(
-                "RED HA -> REVERSING LONG TO SHORT | %s",
-                position_symbol,
+            print(
+                "--> ПОЗИЦИЯ НЕ LONG. "
+                "SHORT НЕ ОТКРЫВАЕМ."
             )
 
-            # First close LONG.
-            close_position(position)
-
-            # Then open SHORT.
-            #
-            # We use the same symbol and current signal price.
-            open_short(
-                position_symbol,
-                signal["price"],
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # SHORT -> CLOSE
-    # --------------------------------------------------------
-
-    if position_side == "Sell":
-
-        if signal["symbol"] != position_symbol:
             return
 
-        if signal["green_trigger"]:
+        current_symbol = position["symbol"]
+        current_size = position["size"]
 
-            logger.info(
-                "GREEN HA -> CLOSE SHORT | %s",
-                position_symbol,
+        # ----------------------------------------------------
+        # CLOSE LONG
+        # ----------------------------------------------------
+
+        print(
+            f"--> REVERSAL: "
+            f"CLOSE LONG {current_symbol}"
+        )
+
+        close_response = session.place_order(
+            category="linear",
+            symbol=current_symbol,
+            side="Sell",
+            orderType="Market",
+            qty=str(current_size),
+            reduceOnly=True,
+            positionIdx=0
+        )
+
+        print(
+            f"--> LONG CLOSED: "
+            f"{close_response}"
+        )
+
+        if close_response.get("retCode") != 0:
+
+            raise Exception(
+                close_response.get(
+                    "retMsg",
+                    "Ошибка закрытия LONG"
+                )
             )
 
-            close_position(position)
+        # ----------------------------------------------------
+        # ЖДЁМ ЗАКРЫТИЯ
+        # ----------------------------------------------------
 
-        return
+        time.sleep(1)
+
+        # ----------------------------------------------------
+        # ПРОВЕРКА
+        # ----------------------------------------------------
+
+        remaining = get_account_position()
+
+        if remaining:
+
+            print(
+                f"--> ПОЗИЦИЯ ЕЩЁ ОТКРЫТА: "
+                f"{remaining}"
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # УСТАНОВКА 3x
+        # ----------------------------------------------------
+
+        set_leverage(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # CURRENT PRICE
+        # ----------------------------------------------------
+
+        price = get_price(
+            symbol
+        )
+
+        # ----------------------------------------------------
+        # НОВЫЙ РАЗМЕР
+        # ----------------------------------------------------
+
+        qty = calculate_quantity(
+            symbol,
+            price
+        )
+
+        # ----------------------------------------------------
+        # OPEN SHORT
+        # ----------------------------------------------------
+
+        print(
+            f"--> ОТКРЫВАЕМ SHORT: "
+            f"{symbol}, qty={qty}"
+        )
+
+        response = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side="Sell",
+            orderType="Market",
+            qty=qty,
+            timeInForce="GoodTillCancel",
+            positionIdx=0
+        )
+
+        print(
+            f"--> SHORT RESPONSE: "
+            f"{response}"
+        )
+
+        if response.get("retCode") != 0:
+
+            raise Exception(
+                response.get(
+                    "retMsg",
+                    "Ошибка открытия SHORT"
+                )
+            )
 
 
 # ============================================================
-# MAIN LOOP
+# CLOSE SHORT
 # ============================================================
 
-def main() -> None:
+def close_short(symbol):
 
-    logger.info("=" * 60)
-    logger.info("HEIKIN ASHI RSI 33 — BYBIT BOT")
-    logger.info("=" * 60)
+    with trade_lock:
 
-    logger.info(
-        "Environment: %s",
-        "TESTNET" if BYBIT_TESTNET else "LIVE",
+        position = get_account_position()
+
+        if not position:
+
+            print(
+                "--> SHORT НЕ НАЙДЕН"
+            )
+
+            return
+
+        if position["side"] != "Sell":
+
+            print(
+                "--> ПОЗИЦИЯ НЕ SHORT"
+            )
+
+            return
+
+        current_symbol = position["symbol"]
+        current_size = position["size"]
+
+        print(
+            f"--> ЗАКРЫВАЕМ SHORT: "
+            f"{current_symbol}, "
+            f"qty={current_size}"
+        )
+
+        response = session.place_order(
+            category="linear",
+            symbol=current_symbol,
+            side="Buy",
+            orderType="Market",
+            qty=str(current_size),
+            reduceOnly=True,
+            positionIdx=0
+        )
+
+        print(
+            f"--> SHORT CLOSED: "
+            f"{response}"
+        )
+
+        if response.get("retCode") != 0:
+
+            raise Exception(
+                response.get(
+                    "retMsg",
+                    "Ошибка закрытия SHORT"
+                )
+            )
+
+
+# ============================================================
+# ОБРАБОТКА ОДНОГО SYMBOL
+# ============================================================
+
+def process_symbol(symbol):
+
+    symbol = normalize_symbol(
+        symbol
     )
 
-    logger.info(
-        "Symbols: %s",
-        ", ".join(SYMBOLS),
-    )
+    try:
 
-    logger.info(
-        "Timeframe: %s",
-        INTERVAL,
-    )
+        analysis = analyze_symbol(
+            symbol
+        )
 
-    logger.info(
-        "RSI: %s | Entry: <%s",
-        RSI_LENGTH,
-        RSI_ENTRY,
-    )
+        if not analysis:
+            return
 
-    logger.info(
-        "Position size: %s%% equity × %sx leverage",
-        MARGIN_PERCENT * 100,
-        LEVERAGE,
-    )
+        candle_time = analysis[
+            "candle_time"
+        ]
 
-    logger.info(
-        "Maximum positions: 1 account-wide"
-    )
+        # ----------------------------------------------------
+        # НЕ ОБРАБАТЫВАЕМ ОДНУ СВЕЧУ ДВАЖДЫ
+        # ----------------------------------------------------
 
-    logger.info("=" * 60)
+        if last_processed_candle.get(symbol) == candle_time:
+            return
+
+        last_processed_candle[
+            symbol
+        ] = candle_time
+
+        # ----------------------------------------------------
+        # LOG
+        # ----------------------------------------------------
+
+        print(
+            f"{symbol} | "
+            f"candle={candle_time} | "
+            f"RSI={analysis['rsi']:.2f} | "
+            f"green={analysis['ha_green']} | "
+            f"red={analysis['ha_red']} | "
+            f"greenTrig={analysis['ha_green_trig']} | "
+            f"redTrig={analysis['ha_red_trig']}"
+        )
+
+        # ----------------------------------------------------
+        # ACCOUNT POSITION
+        # ----------------------------------------------------
+
+        position = get_account_position()
+
+        # ====================================================
+        # НЕТ ПОЗИЦИИ
+        # ====================================================
+
+        if not position:
+
+            # EXACT PINE:
+            # RSI < 33 AND red -> green
+
+            if analysis["long_condition"]:
+
+                print(
+                    f"--> LONG SIGNAL: {symbol}"
+                )
+
+                open_long(
+                    symbol
+                )
+
+            return
+
+        # ====================================================
+        # ЕСТЬ LONG
+        # ====================================================
+
+        if position["side"] == "Buy":
+
+            # ------------------------------------------------
+            # Только новый красный HA
+            # ------------------------------------------------
+
+            if (
+                position["symbol"] == symbol
+                and analysis["ha_red_trig"]
+            ):
+
+                print(
+                    f"--> SHORT SIGNAL: {symbol}"
+                )
+
+                open_short(
+                    symbol
+                )
+
+            return
+
+        # ====================================================
+        # ЕСТЬ SHORT
+        # ====================================================
+
+        if position["side"] == "Sell":
+
+            # ------------------------------------------------
+            # Только новый зелёный HA
+            # ------------------------------------------------
+
+            if (
+                position["symbol"] == symbol
+                and analysis["ha_green_trig"]
+            ):
+
+                print(
+                    f"--> CLOSE SHORT SIGNAL: "
+                    f"{symbol}"
+                )
+
+                close_short(
+                    symbol
+                )
+
+            return
+
+    except Exception as e:
+
+        print(
+            f"--> ERROR {symbol}: {e}"
+        )
+
+
+# ============================================================
+# ОСНОВНОЙ ЦИКЛ СТРАТЕГИИ
+# ============================================================
+
+def strategy_loop():
+
+    print("")
+    print("=" * 60)
+    print("HEIKIN ASHI RSI 33 — BYBIT BOT")
+    print("=" * 60)
+    print(
+        f"Environment: "
+        f"{'TESTNET' if TESTNET else 'LIVE'}"
+    )
+    print(
+        f"Symbols: {', '.join(SYMBOLS)}"
+    )
+    print(
+        f"Timeframe: {TIMEFRAME}"
+    )
+    print(
+        f"RSI: {RSI_LENGTH} | "
+        f"Entry: <{RSI_ENTRY}"
+    )
+    print(
+        f"Position size: "
+        f"{EQUITY_PERCENT * 100:.0f}% "
+        f"equity × {LEVERAGE}x leverage"
+    )
+    print(
+        "Maximum positions: "
+        "1 account-wide"
+    )
+    print("=" * 60)
+    print("")
 
     while True:
 
@@ -880,28 +1236,47 @@ def main() -> None:
 
             for symbol in SYMBOLS:
 
-                try:
-                    process_symbol(symbol)
+                process_symbol(
+                    symbol
+                )
 
-                except Exception as error:
+        except Exception as e:
 
-                    logger.exception(
-                        "Error processing %s: %s",
-                        symbol,
-                        error,
-                    )
-
-                # Small pause between symbols.
-                time.sleep(0.2)
-
-        except Exception as error:
-
-            logger.exception(
-                "Main loop error: %s",
-                error,
+            print(
+                f"--> MAIN LOOP ERROR: {e}"
             )
 
-        time.sleep(POLL_SECONDS)
+        time.sleep(
+            POLL_SECONDS
+        )
+
+
+# ============================================================
+# RENDER HEALTH CHECK
+# ============================================================
+
+@app.route(
+    "/",
+    methods=["GET", "HEAD"]
+)
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "bot": "HEIKIN ASHI RSI 33",
+        "environment": (
+            "TESTNET"
+            if TESTNET
+            else "LIVE"
+        ),
+        "symbols": SYMBOLS,
+        "timeframe": TIMEFRAME,
+        "rsi_length": RSI_LENGTH,
+        "rsi_entry": RSI_ENTRY,
+        "equity_percent": EQUITY_PERCENT,
+        "leverage": LEVERAGE,
+        "max_positions": 1
+    }), 200
 
 
 # ============================================================
@@ -909,4 +1284,25 @@ def main() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    # Запускаем торговую стратегию
+    # в отдельном потоке
+    strategy_thread = threading.Thread(
+        target=strategy_loop,
+        daemon=True
+    )
+
+    strategy_thread.start()
+
+    # Render должен видеть открытый PORT
+    port = int(
+        os.environ.get(
+            "PORT",
+            "10000"
+        )
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
